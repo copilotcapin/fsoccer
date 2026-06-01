@@ -221,7 +221,7 @@ def norm_text(s: str) -> str:
 
 TEAM_DROP_TOKENS = {
     "fc", "cf", "sc", "afc", "cfc", "ac", "as", "cd", "sd", "ca", "ec", "fk", "bk",
-    "club", "football", "soccer", "team", "de", "da", "do", "del", "la", "the",
+    "club", "football", "soccer", "team", "cs", "de", "da", "do", "del", "la", "the",
     "men", "women", "w", "u18", "u19", "u20", "u21", "u23", "ii", "b", "reserves",
 }
 
@@ -376,10 +376,17 @@ def norm_market_type(value: str) -> str:
 
 def infer_market_type(question: str, proposed: str, home: str, away: str, requested: str = "auto") -> str:
     requested_norm = norm_market_type(requested or "auto")
-    if requested_norm in {"moneyline", "draw_binary", "home_win_binary", "away_win_binary"}:
+    if requested_norm in {"moneyline", "draw_binary", "home_win_binary", "away_win_binary", "total", "spread", "halftime_leader_binary"}:
         return requested_norm
 
     q = norm_text(question or "")
+    p = norm_text(proposed or "")
+    if "spread" in q:
+        return "spread"
+    if "o/u" in (question or "").lower() or "over under" in q or "total" in q or p in {"over", "under"}:
+        return "total"
+    if "leading at halftime" in q or "lead at halftime" in q or "halftime" in q and "leading" in q:
+        return "halftime_leader_binary"
     proposed_yes_no = is_yes(proposed) or is_no(proposed)
     if proposed_yes_no and ("draw" in q or " tie" in (" " + q)):
         return "draw_binary"
@@ -437,6 +444,191 @@ def proposed_matches_winner(
     if winner_is_draw:
         return False, "match ended in a draw"
     return same_team(proposed, winner), "proposed side matched against final winner"
+
+
+def _clean_numeric_text(s: str) -> str:
+    return (s or "").replace("−", "-").replace("–", "-").replace("—", "-")
+
+
+def _parse_float(value: str) -> Optional[float]:
+    m = re.search(r"[+-]?\d+(?:\.\d+)?", _clean_numeric_text(value or ""))
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except Exception:
+        return None
+
+
+def score_pair(match: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    hs = parse_int(match.get("home_score"))
+    aw = parse_int(match.get("away_score"))
+    if hs is None or aw is None:
+        return None
+    return hs, aw
+
+
+def first_half_pair(match: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    hp = match.get("home_parts") or []
+    ap = match.get("away_parts") or []
+    if not hp or not ap:
+        return None
+    hs = parse_int(hp[0])
+    aw = parse_int(ap[0])
+    if hs is None or aw is None:
+        return None
+    return hs, aw
+
+
+def extract_total_line(question: str) -> Optional[float]:
+    q = _clean_numeric_text(question or "")
+    patterns = [
+        r"\bO\s*/\s*U\s*([0-9]+(?:\.[0-9]+)?)",
+        r"\bOver\s*/\s*Under\s*([0-9]+(?:\.[0-9]+)?)",
+        r"\bTotal\s*(?:Goals?)?\s*([0-9]+(?:\.[0-9]+)?)",
+        r"\b(?:Over|Under)\s*([0-9]+(?:\.[0-9]+)?)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, q, flags=re.I)
+        if m:
+            return _parse_float(m.group(1))
+    return None
+
+
+def extract_spread(question: str) -> Optional[Tuple[str, float]]:
+    q = _clean_numeric_text(question or "")
+    m = re.search(r"\bSpread\s*:\s*(.+?)\s*\(([+-]?\d+(?:\.\d+)?)\)", q, flags=re.I)
+    if not m:
+        return None
+    team = collapse_ws(m.group(1))
+    line = _parse_float(m.group(2))
+    if not team or line is None:
+        return None
+    return team, line
+
+
+def _side_from_team_name(name: str, home: str, away: str) -> Optional[str]:
+    if not name:
+        return None
+    h = team_similarity(name, home)
+    a = team_similarity(name, away)
+    if h >= 0.70 and h >= a:
+        return "home"
+    if a >= 0.70:
+        return "away"
+    return None
+
+
+def _opposite_side(side: str) -> str:
+    return "away" if side == "home" else "home"
+
+
+def _side_name(side: str, home: str, away: str) -> str:
+    return home if side == "home" else away
+
+
+def evaluate_total_market(match: Dict[str, Any], proposed: str, question: str) -> Tuple[Optional[bool], str]:
+    scores = score_pair(match)
+    if not scores:
+        return None, "total market needs a parseable final score"
+    if not is_final_status(str(match.get("status") or "")):
+        return None, "matched Flashscore row, but total market is not final yet"
+    line = extract_total_line(question)
+    if line is None:
+        return None, "total market needs an O/U line in the question/title"
+    hs, aw = scores
+    total = hs + aw
+    p = norm_text(proposed)
+    if p not in {"over", "under"}:
+        return None, "total market needs proposed=Over or proposed=Under"
+    if abs(float(total) - line) < 1e-9:
+        return None, "total landed exactly on the line; treating as push/unsupported"
+    won = total > line if p == "over" else total < line
+    return won, "final score %s-%s gives total=%s vs line %.3g; proposed=%s" % (hs, aw, total, line, proposed)
+
+
+def evaluate_spread_market(match: Dict[str, Any], proposed: str, question: str) -> Tuple[Optional[bool], str]:
+    scores = score_pair(match)
+    if not scores:
+        return None, "spread market needs a parseable final score"
+    if not is_final_status(str(match.get("status") or "")):
+        return None, "matched Flashscore row, but spread market is not final yet"
+    parsed = extract_spread(question)
+    if not parsed:
+        return None, "spread market needs a title like Spread: Team (-1.5)"
+    spread_team, line = parsed
+    home = str(match.get("home") or "")
+    away = str(match.get("away") or "")
+    spread_side = _side_from_team_name(spread_team, home, away)
+    if not spread_side:
+        return None, "could not map spread team %r to Flashscore home/away teams" % spread_team
+    proposed_side = _side_from_team_name(proposed, home, away)
+    if not proposed_side:
+        if is_yes(proposed):
+            proposed_side = spread_side
+        elif is_no(proposed):
+            proposed_side = _opposite_side(spread_side)
+        else:
+            return None, "could not map proposed side %r to Flashscore home/away teams" % proposed
+    hs, aw = scores
+    spread_score = hs if spread_side == "home" else aw
+    other_score = aw if spread_side == "home" else hs
+    adjusted_margin = float(spread_score) + float(line) - float(other_score)
+    if abs(adjusted_margin) < 1e-9:
+        return None, "spread landed exactly on the line; treating as push/unsupported"
+    spread_covers = adjusted_margin > 0
+    proposed_won = spread_covers if proposed_side == spread_side else (not spread_covers)
+    return proposed_won, "%s %.3g cover=%s from final score %s-%s; proposed side=%s" % (
+        _side_name(spread_side, home, away), line, spread_covers, hs, aw, _side_name(proposed_side, home, away)
+    )
+
+
+def extract_halftime_target(question: str, home: str, away: str) -> Optional[str]:
+    raw = question or ""
+    m = re.search(r"(.+?)\s+(?:leading|lead)\s+at\s+half\s*time", raw, flags=re.I)
+    target = collapse_ws(m.group(1)) if m else ""
+    side = _side_from_team_name(target, home, away) if target else None
+    if side:
+        return side
+    # Fallback: whichever team name is more present in the full question.
+    h = team_similarity(home, raw)
+    a = team_similarity(away, raw)
+    if h >= 0.70 and h >= a:
+        return "home"
+    if a >= 0.70:
+        return "away"
+    return None
+
+
+def evaluate_halftime_leader_market(match: Dict[str, Any], proposed: str, question: str) -> Tuple[Optional[bool], str]:
+    fh = first_half_pair(match)
+    if not fh:
+        return None, "halftime leader market needs first-half score proof from Flashscore HTTP periods"
+    home = str(match.get("home") or "")
+    away = str(match.get("away") or "")
+    target_side = extract_halftime_target(question, home, away)
+    if not target_side:
+        return None, "could not map halftime-leading target team from question/title"
+    if not (is_yes(proposed) or is_no(proposed)):
+        return None, "halftime leader market needs proposed=Yes or proposed=No"
+    h1, a1 = fh
+    target_leading = h1 > a1 if target_side == "home" else a1 > h1
+    proposed_won = target_leading if is_yes(proposed) else (not target_leading)
+    return proposed_won, "first-half score %s-%s; target=%s leading=%s; proposed=%s" % (
+        h1, a1, _side_name(target_side, home, away), target_leading, proposed
+    )
+
+
+def evaluate_score_market(match: Dict[str, Any], proposed: str, question: str, market_type: str) -> Tuple[Optional[bool], str]:
+    mt = norm_market_type(market_type)
+    if mt == "total":
+        return evaluate_total_market(match, proposed, question)
+    if mt == "spread":
+        return evaluate_spread_market(match, proposed, question)
+    if mt == "halftime_leader_binary":
+        return evaluate_halftime_leader_market(match, proposed, question)
+    return None, "not a score-prop market"
+
 
 def _cache_get(key: str) -> Optional[Any]:
     hit = _cache.get(key)
@@ -880,7 +1072,7 @@ async def root() -> str:
   <div class="row"><input id="away" value="Ukraine" /> away/team 2</div>
   <div class="row"><input id="proposed" value="Ukraine" /> proposed side</div>
   <div class="row"><input id="question" value="Poland vs. Ukraine" /> optional question/title</div>
-  <div class="row"><input id="market_type" value="auto" /> market_type: auto, moneyline, draw_binary, home_win_binary, away_win_binary</div>
+  <div class="row"><input id="market_type" value="auto" /> market_type: auto, moneyline, draw_binary, home_win_binary, away_win_binary, total, spread, halftime_leader_binary</div>
   <div class="row">
     <select id="source"><option>auto</option><option>feed</option><option>html</option></select>
     <select id="domain"><option>com</option><option>both</option><option>usa</option></select>
@@ -933,6 +1125,8 @@ async def health() -> Dict[str, Any]:
             "competition parser preserves ZA tournament/league rows",
             "details endpoint can exhaust all f_1_0_X feed candidates",
             "competition filter is diagnostic/bonus instead of hiding exact team-pair matches",
+            "CS/Sporting club-name aliases are normalized for soccer matching",
+            "details endpoint supports totals, spreads, and halftime-leading binary markets",
         ],
     }
 
@@ -959,7 +1153,7 @@ async def soccer_details(
     proposed: str = Query(..., description="Proposed side: home team, away team, Draw, Yes, or No"),
     tournament: str = Query("", description="Optional competition/league filter, e.g. FIFA Friendly"),
     question: str = Query("", description="Optional full Polymarket question/title for auto-detecting Yes/No draw/team markets."),
-    market_type: str = Query("auto", description="auto, moneyline, draw_binary, home_win_binary, or away_win_binary"),
+    market_type: str = Query("auto", description="auto, moneyline, draw_binary, home_win_binary, away_win_binary, total, spread, or halftime_leader_binary"),
     date: Optional[str] = Query(None, description="Optional YYYY-MM-DD"),
     source: str = Query("auto", description="auto, feed, or html"),
     domain: str = Query("com", description="com, usa, or both"),
@@ -995,21 +1189,51 @@ async def soccer_details(
             "parser_meta": data.get("parser_meta", [])[:3],
         }
 
-    winner, basis = determine_winner(match)
     matched = compact_match(match)
+    resolved_market_type = infer_market_type(question=question, proposed=proposed, home=home, away=away, requested=market_type)
+
+    if resolved_market_type in {"total", "spread", "halftime_leader_binary"}:
+        proposed_won, proposal_basis = evaluate_score_market(
+            match=match,
+            proposed=proposed,
+            question=question,
+            market_type=resolved_market_type,
+        )
+        if proposed_won is None:
+            return {
+                "verdict": "unsupported_or_not_ready",
+                "verified": False,
+                "safe_to_buy_yes": False,
+                "reason": proposal_basis,
+                "target": {"home": home, "away": away, "proposed": proposed, "question": question, "market_type": market_type, "resolved_market_type": resolved_market_type, "tournament": tournament, "date": date},
+                "matched": matched,
+                "nearest": nearest,
+                "attempts": data.get("attempts", [])[:10],
+            }
+        return {
+            "verdict": "verified_win" if proposed_won else "verified_loss",
+            "verified": True,
+            "safe_to_buy_yes": bool(proposed_won),
+            "reason": "Flashscore HTTP matched soccer row. market_type=%s; %s." % (resolved_market_type, proposal_basis),
+            "target": {"home": home, "away": away, "proposed": proposed, "question": question, "market_type": market_type, "resolved_market_type": resolved_market_type, "tournament": tournament, "date": date},
+            "matched": matched,
+            "nearest": nearest,
+            "attempts": data.get("attempts", [])[:10],
+        }
+
+    winner, basis = determine_winner(match)
     if not winner:
         return {
             "verdict": "not_final_or_no_winner_proof",
             "verified": False,
             "safe_to_buy_yes": False,
             "reason": "Matched the Flashscore row, but could not prove a final winner from HTTP data yet.",
-            "target": {"home": home, "away": away, "proposed": proposed, "question": question, "market_type": market_type, "tournament": tournament, "date": date},
+            "target": {"home": home, "away": away, "proposed": proposed, "question": question, "market_type": market_type, "resolved_market_type": resolved_market_type, "tournament": tournament, "date": date},
             "matched": matched,
             "nearest": nearest,
             "attempts": data.get("attempts", [])[:10],
         }
 
-    resolved_market_type = infer_market_type(question=question, proposed=proposed, home=home, away=away, requested=market_type)
     proposed_won, proposal_basis = proposed_matches_winner(
         proposed=proposed,
         winner=winner,

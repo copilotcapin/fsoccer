@@ -43,7 +43,20 @@ curl "http://127.0.0.1:3003/v2/debug/search?date=2026-05-31&q=Ukraine&domain=bot
   - `market_type=draw_binary`
   - `market_type=home_win_binary`
   - `market_type=away_win_binary`
-  - `market_type=auto` with optional `question=` for Yes/No draw markets.
+  - `market_type=total` for O/U markets like `O/U 2.5` with `proposed=Over` or `Under`
+  - `market_type=spread` for titles like `Spread: Team (-1.5)`
+  - `market_type=halftime_leader_binary` for `Team leading at halftime?` with `proposed=Yes` or `No`
+  - `market_type=auto` with optional `question=` to infer the above where possible.
+
+Examples for the pasted markets:
+
+```bash
+curl "http://127.0.0.1:3003/v2/soccer/details?date=2026-05-31&home=CS%20Cienciano&away=CS%20Cristal&proposed=Over&question=CS%20Cienciano%20vs.%20CS%20Cristal%3A%20O%2FU%202.5&market_type=auto&domain=both&exhaustive=true"
+
+curl "http://127.0.0.1:3003/v2/soccer/details?date=2026-05-31&home=CS%20Cienciano&away=CS%20Cristal&proposed=CS%20Cristal&question=Spread%3A%20CS%20Cienciano%20%28-1.5%29&market_type=auto&domain=both&exhaustive=true"
+
+curl "http://127.0.0.1:3003/v2/soccer/details?date=2026-05-31&home=Brazil&away=Panama&proposed=Brazil&question=Spread%3A%20Panama%20%28-2.5%29&market_type=auto&domain=both&exhaustive=true"
+```
 
 ## Deploy to Vercel
 
