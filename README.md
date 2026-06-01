@@ -1,63 +1,35 @@
-# Flashscore Soccer HTTP Test API
+# Flashscore Soccer HTTP API
 
-Unofficial FastAPI/Vercel test wrapper for Flashscore soccer HTTP/xfeed.
+Unofficial FastAPI/Vercel wrapper for Flashscore soccer xfeed.
 
-This is meant to test the same kind of browser-free verifier path you can call
-from `propose.py`, without Playwright/Chromium.
+## Endpoints
 
-## Run locally
+- `/v2/health`
+- `/v2/soccer`
+- `/v2/soccer/details`
+- `/v2/debug/fetch`
+- `/v2/debug/raw`
+- `/v2/debug/search`
 
-```bash
-python3 -m pip install -r requirements.txt
-python3 main.py
-```
+## Main verifier endpoint
 
-Open:
-
-```text
-http://127.0.0.1:3003/
-```
-
-## Key endpoints
+Use one endpoint for winner, draw, total goals/points, spread/handicap, and halftime-leading markets:
 
 ```bash
-curl "http://127.0.0.1:3003/v2/health"
-
-curl "http://127.0.0.1:3003/v2/soccer/details?date=2026-05-31&tournament=FIFA%20Friendly&home=Poland&away=Ukraine&proposed=Ukraine&domain=both&exhaustive=true"
-
-curl "http://127.0.0.1:3003/v2/soccer/details?date=2026-05-31&home=Poland&away=Ukraine&question=Will%20Poland%20vs%20Ukraine%20end%20in%20a%20draw%3F&proposed=No&market_type=auto&domain=both&exhaustive=true"
-
-curl "http://127.0.0.1:3003/v2/debug/fetch?date=2026-05-31&source=feed&domain=both&exhaustive=true"
-
-curl "http://127.0.0.1:3003/v2/debug/search?date=2026-05-31&q=Ukraine&domain=both"
+/v2/soccer/details?date=2026-05-31&home=CS%20Cienciano&away=CS%20Cristal&proposed=Over&question=CS%20Cienciano%20vs.%20CS%20Cristal:%20O/U%202.5
 ```
 
-## What changed from the tennis version
+`market_type=auto` is the default. The API infers market type from the `question` text.
 
-- Uses Flashscore soccer/football xfeed candidates: `f_1_0_X_en_1`.
-- Uses `/football/` referer for `flashscore.com` and `/soccer/` for `flashscoreusa.com`.
-- Replaces tennis player matching with soccer team matching.
-- Final score winner logic supports home win, away win, and draw.
-- `/v2/soccer/details` supports:
-  - `market_type=moneyline`
-  - `market_type=draw_binary`
-  - `market_type=home_win_binary`
-  - `market_type=away_win_binary`
-  - `market_type=total` for O/U markets like `O/U 2.5` with `proposed=Over` or `Under`
-  - `market_type=spread` for titles like `Spread: Team (-1.5)`
-  - `market_type=halftime_leader_binary` for `Team leading at halftime?` with `proposed=Yes` or `No`
-  - `market_type=auto` with optional `question=` to infer the above where possible.
+Supported auto-detected titles include examples like:
 
-Examples for the pasted markets:
+- `Team A vs Team B`
+- `Will Team A win?`
+- `Will Team A vs Team B end in a draw?`
+- `Team A vs Team B: O/U 2.5`
+- `Total Goals Over 2.5`
+- `Spread: Team A (-1.5)`
+- `Handicap: Team A -1.5`
+- `Team A leading at halftime?`
 
-```bash
-curl "http://127.0.0.1:3003/v2/soccer/details?date=2026-05-31&home=CS%20Cienciano&away=CS%20Cristal&proposed=Over&question=CS%20Cienciano%20vs.%20CS%20Cristal%3A%20O%2FU%202.5&market_type=auto&domain=both&exhaustive=true"
-
-curl "http://127.0.0.1:3003/v2/soccer/details?date=2026-05-31&home=CS%20Cienciano&away=CS%20Cristal&proposed=CS%20Cristal&question=Spread%3A%20CS%20Cienciano%20%28-1.5%29&market_type=auto&domain=both&exhaustive=true"
-
-curl "http://127.0.0.1:3003/v2/soccer/details?date=2026-05-31&home=Brazil&away=Panama&proposed=Brazil&question=Spread%3A%20Panama%20%28-2.5%29&market_type=auto&domain=both&exhaustive=true"
-```
-
-## Deploy to Vercel
-
-Upload/import this folder to Vercel. `vercel.json` points Vercel to `app.py`, which imports the FastAPI app from `main.py`.
+For totals and spreads, the API only needs the Flashscore final score. For halftime-leading markets, it needs first-half period score fields from Flashscore HTTP.

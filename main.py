@@ -4,7 +4,7 @@ Python 3.9 compatible.
 
 Purpose:
   - Test whether Flashscore soccer can be fetched from Vercel/EC2 without Playwright.
-  - Provide a compact verifier-style endpoint for Polymarket soccer winner/draw markets.
+  - Provide a compact verifier-style endpoint for Polymarket soccer winner/draw/total/spread/handicap/halftime markets.
 
 Layout:
   main.py
@@ -20,6 +20,8 @@ Examples:
   curl "http://127.0.0.1:3003/v2/health"
   curl "http://127.0.0.1:3003/v2/soccer?date=2026-05-31&source=auto"
   curl "http://127.0.0.1:3003/v2/soccer/details?date=2026-05-31&tournament=FIFA%20Friendly&home=Poland&away=Ukraine&proposed=Ukraine"
+  curl "http://127.0.0.1:3003/v2/soccer/details?date=2026-05-31&home=CS%20Cienciano&away=CS%20Cristal&proposed=Over&question=CS%20Cienciano%20vs.%20CS%20Cristal:%20O/U%202.5"
+  curl "http://127.0.0.1:3003/v2/soccer/details?date=2026-05-31&home=CS%20Cienciano&away=CS%20Cristal&proposed=CS%20Cristal&question=Spread:%20CS%20Cienciano%20(-1.5)"
   curl "http://127.0.0.1:3003/v2/debug/fetch?source=feed&date=2026-05-31"
   curl "http://127.0.0.1:3003/v2/debug/search?date=2026-05-31&q=Ukraine"
 """
@@ -121,7 +123,7 @@ HEADER_PROFILES = [
 
 app = FastAPI(
     title="Flashscore Soccer HTTP Test API",
-    version="1.1.0",
+    version="1.2.0",
     description="Unofficial Flashscore soccer HTTP verifier/debug API for Vercel.",
 )
 app.add_middleware(
@@ -376,17 +378,51 @@ def norm_market_type(value: str) -> str:
 
 def infer_market_type(question: str, proposed: str, home: str, away: str, requested: str = "auto") -> str:
     requested_norm = norm_market_type(requested or "auto")
-    if requested_norm in {"moneyline", "draw_binary", "home_win_binary", "away_win_binary", "total", "spread", "halftime_leader_binary"}:
+    supported = {
+        "moneyline",
+        "draw_binary",
+        "home_win_binary",
+        "away_win_binary",
+        "total",
+        "spread",
+        "handicap",
+        "halftime_leader_binary",
+    }
+    if requested_norm in supported and requested_norm != "handicap":
         return requested_norm
-
-    q = norm_text(question or "")
-    p = norm_text(proposed or "")
-    if "spread" in q:
+    if requested_norm == "handicap":
         return "spread"
-    if "o/u" in (question or "").lower() or "over under" in q or "total" in q or p in {"over", "under"}:
+
+    raw_q = question or ""
+    raw_q_l = raw_q.lower()
+    q = norm_text(raw_q)
+    p = norm_text(proposed or "")
+
+    # One generic endpoint is enough. Keep market_type=auto and infer from the
+    # title/question. We only need a final score for total/spread/handicap, and
+    # first-half period score for halftime-leading markets.
+    if re.search(r"\b(spread|handicap|asian\s+handicap|run\s*line|goal\s*line)\b", q):
+        return "spread"
+    if (
+        "o/u" in raw_q_l
+        or "o / u" in raw_q_l
+        or "over/under" in raw_q_l
+        or "over under" in q
+        or re.search(r"\btotal\b", q)
+        or re.search(r"\b(goals?|points?)\b", q) and p in {"over", "under"}
+        or p in {"over", "under"}
+    ):
         return "total"
-    if "leading at halftime" in q or "lead at halftime" in q or "halftime" in q and "leading" in q:
+    if (
+        "leading at halftime" in q
+        or "lead at halftime" in q
+        or "leading at half time" in q
+        or "lead at half time" in q
+        or ("halftime" in q and ("leading" in q or "leader" in q or "lead" in q))
+        or ("half time" in q and ("leading" in q or "leader" in q or "lead" in q))
+    ):
         return "halftime_leader_binary"
+
     proposed_yes_no = is_yes(proposed) or is_no(proposed)
     if proposed_yes_no and ("draw" in q or " tie" in (" " + q)):
         return "draw_binary"
@@ -485,8 +521,11 @@ def extract_total_line(question: str) -> Optional[float]:
     patterns = [
         r"\bO\s*/\s*U\s*([0-9]+(?:\.[0-9]+)?)",
         r"\bOver\s*/\s*Under\s*([0-9]+(?:\.[0-9]+)?)",
-        r"\bTotal\s*(?:Goals?)?\s*([0-9]+(?:\.[0-9]+)?)",
-        r"\b(?:Over|Under)\s*([0-9]+(?:\.[0-9]+)?)",
+        r"\bTotal\s*(?:Goals?|Points?)?\s*[:=-]?\s*([0-9]+(?:\.[0-9]+)?)",
+        r"\bTotal\s*(?:Goals?|Points?)?\s*[:=-]?\s*(?:Over|Under)\s*([0-9]+(?:\.[0-9]+)?)",
+        r"\b(?:Over|Under)\s*([0-9]+(?:\.[0-9]+)?)(?:\s*(?:Goals?|Points?))?",
+        r"\b(?:Goals?|Points?)\s*[:=-]?\s*(?:Over|Under)\s*([0-9]+(?:\.[0-9]+)?)",
+        r"\b(?:Goals?|Points?)\s*[:=-]?\s*O\s*/\s*U\s*([0-9]+(?:\.[0-9]+)?)",
     ]
     for pat in patterns:
         m = re.search(pat, q, flags=re.I)
@@ -495,16 +534,33 @@ def extract_total_line(question: str) -> Optional[float]:
     return None
 
 
-def extract_spread(question: str) -> Optional[Tuple[str, float]]:
+def extract_spread(question: str, home: str = "", away: str = "") -> Optional[Tuple[str, float]]:
     q = _clean_numeric_text(question or "")
-    m = re.search(r"\bSpread\s*:\s*(.+?)\s*\(([+-]?\d+(?:\.\d+)?)\)", q, flags=re.I)
-    if not m:
-        return None
-    team = collapse_ws(m.group(1))
-    line = _parse_float(m.group(2))
-    if not team or line is None:
-        return None
-    return team, line
+    patterns = [
+        # Spread: Team (-1.5), Handicap: Team +1.5, Asian Handicap: Team (-0.25)
+        r"\b(?:Spread|Handicap|Asian\s+Handicap|Goal\s*Line|Run\s*Line)\s*:\s*(.+?)\s*\(?\s*([+-]?\d+(?:\.\d+)?)\s*\)?(?:\b|$)",
+        # Team -1.5 spread / Team +1.5 handicap
+        r"^\s*(.+?)\s*\(?\s*([+-]\d+(?:\.\d+)?)\s*\)?\s*(?:spread|handicap|asian\s+handicap|goal\s*line)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, q, flags=re.I)
+        if not m:
+            continue
+        team = collapse_ws(m.group(1))
+        line = _parse_float(m.group(2))
+        if team and line is not None:
+            return team, line
+
+    # If the line is present but the team is only implied by the market title,
+    # map the title to whichever supplied team name appears most strongly.
+    m_line = re.search(r"([+-]\d+(?:\.\d+)?)", q)
+    if m_line:
+        line = _parse_float(m_line.group(1))
+        h = team_similarity(home, q) if home else 0.0
+        a = team_similarity(away, q) if away else 0.0
+        if line is not None and max(h, a) >= 0.70:
+            return (home if h >= a else away), line
+    return None
 
 
 def _side_from_team_name(name: str, home: str, away: str) -> Optional[str]:
@@ -553,9 +609,9 @@ def evaluate_spread_market(match: Dict[str, Any], proposed: str, question: str) 
         return None, "spread market needs a parseable final score"
     if not is_final_status(str(match.get("status") or "")):
         return None, "matched Flashscore row, but spread market is not final yet"
-    parsed = extract_spread(question)
+    parsed = extract_spread(question, home=str(match.get("home") or ""), away=str(match.get("away") or ""))
     if not parsed:
-        return None, "spread market needs a title like Spread: Team (-1.5)"
+        return None, "spread/handicap market needs a line in the question/title, e.g. Spread: Team (-1.5)"
     spread_team, line = parsed
     home = str(match.get("home") or "")
     away = str(match.get("away") or "")
@@ -1072,7 +1128,7 @@ async def root() -> str:
   <div class="row"><input id="away" value="Ukraine" /> away/team 2</div>
   <div class="row"><input id="proposed" value="Ukraine" /> proposed side</div>
   <div class="row"><input id="question" value="Poland vs. Ukraine" /> optional question/title</div>
-  <div class="row"><input id="market_type" value="auto" /> market_type: auto, moneyline, draw_binary, home_win_binary, away_win_binary, total, spread, halftime_leader_binary</div>
+  <div class="row"><input id="market_type" value="auto" /> market_type: auto is usually enough; optional override: moneyline, draw_binary, home_win_binary, away_win_binary, total, spread/handicap, halftime_leader_binary</div>
   <div class="row">
     <select id="source"><option>auto</option><option>feed</option><option>html</option></select>
     <select id="domain"><option>com</option><option>both</option><option>usa</option></select>
@@ -1110,7 +1166,7 @@ async def health() -> Dict[str, Any]:
     return {
         "ok": True,
         "service": "flashscore-soccer-http-test-api",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "python_compatible": "3.9+",
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
         "x_fsign_set": bool(FLASHSCORE_X_FSIGN),
@@ -1126,7 +1182,7 @@ async def health() -> Dict[str, Any]:
             "details endpoint can exhaust all f_1_0_X feed candidates",
             "competition filter is diagnostic/bonus instead of hiding exact team-pair matches",
             "CS/Sporting club-name aliases are normalized for soccer matching",
-            "details endpoint supports totals, spreads, and halftime-leading binary markets",
+            "market_type=auto detects totals, spreads/handicaps, and halftime-leading binary markets from question/title",
         ],
     }
 
@@ -1153,7 +1209,7 @@ async def soccer_details(
     proposed: str = Query(..., description="Proposed side: home team, away team, Draw, Yes, or No"),
     tournament: str = Query("", description="Optional competition/league filter, e.g. FIFA Friendly"),
     question: str = Query("", description="Optional full Polymarket question/title for auto-detecting Yes/No draw/team markets."),
-    market_type: str = Query("auto", description="auto, moneyline, draw_binary, home_win_binary, away_win_binary, total, spread, or halftime_leader_binary"),
+    market_type: str = Query("auto", description="auto is usually enough; optional override: moneyline, draw_binary, home_win_binary, away_win_binary, total, spread/handicap, or halftime_leader_binary"),
     date: Optional[str] = Query(None, description="Optional YYYY-MM-DD"),
     source: str = Query("auto", description="auto, feed, or html"),
     domain: str = Query("com", description="com, usa, or both"),
