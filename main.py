@@ -122,9 +122,9 @@ HEADER_PROFILES = [
 ]
 
 app = FastAPI(
-    title="Flashscore Soccer HTTP Test API",
+    title="Flashscore Soccer + Basketball HTTP Test API",
     version="1.2.0",
-    description="Unofficial Flashscore soccer HTTP verifier/debug API for Vercel.",
+    description="Unofficial Flashscore soccer/basketball HTTP verifier/debug API for Vercel.",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -1120,7 +1120,7 @@ async def root() -> str:
   </style>
 </head>
 <body>
-  <h2>Flashscore Soccer HTTP Test API</h2>
+  <h2>Flashscore Soccer + Basketball HTTP Test API</h2>
   <p>Tests the same kind of verifier endpoint you can call from propose.py without using Playwright.</p>
   <div class="row"><input id="date" value="2026-05-31" /> date</div>
   <div class="row"><input id="tournament" value="FIFA Friendly" /> tournament</div>
@@ -1165,7 +1165,7 @@ async def root() -> str:
 async def health() -> Dict[str, Any]:
     return {
         "ok": True,
-        "service": "flashscore-soccer-http-test-api",
+        "service": "flashscore-soccer-basketball-http-test-api",
         "version": "1.2.0",
         "python_compatible": "3.9+",
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
@@ -1173,7 +1173,10 @@ async def health() -> Dict[str, Any]:
         "endpoints": [
             "/v2/soccer",
             "/v2/soccer/details",
+            "/v2/basketball",
+            "/v2/basketball/details",
             "/v2/debug/fetch",
+            "/v2/debug/basketball/fetch",
             "/v2/debug/raw",
             "/v2/debug/search",
         ],
@@ -1431,3 +1434,305 @@ async def debug_search(
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=API_PORT, reload=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Basketball extension (Python 3.9 compatible)
+# ─────────────────────────────────────────────────────────────────────────────
+# The original wrapper above is soccer-only: it uses Flashscore sport id 1 and
+# /football/ or /soccer/ page paths. Basketball uses sport id 3 on the same
+# x/feed pattern. These endpoints are intentionally small and reuse the same
+# parser/evaluator primitives because Flashscore feed rows expose the same
+# AE/AF team and AG/AH score fields across sports.
+
+BASKETBALL_SPORT_PATHS = {
+    "com": "/basketball/",
+    "usa": "/basketball/",
+}
+
+BASKETBALL_FEED_CANDIDATES = [
+    "/x/feed/f_3_0_0_en_1",
+    "/x/feed/f_3_1_0_en_1",
+    "/x/feed/f_3_0_1_en_1",
+    "/x/feed/f_3_1_1_en_1",
+    "/x/feed/f_3_0_2_en_1",
+    "/x/feed/f_3_1_2_en_1",
+    "/x/feed/f_3_0_3_en_1",
+    "/x/feed/f_3_1_3_en_1",
+    "/x/feed/f_3_0_4_en_1",
+    "/x/feed/f_3_1_4_en_1",
+]
+
+
+def basketball_path(domain_key: str) -> str:
+    return BASKETBALL_SPORT_PATHS.get(domain_key, "/basketball/")
+
+
+def build_basketball_feed_urls(domain_key: str = "com", date: Optional[str] = None) -> List[str]:
+    base = DOMAINS.get(domain_key, DOMAINS["com"])
+    out: List[str] = []
+    compact = re.sub(r"[^0-9]", "", date or "")
+    for path in BASKETBALL_FEED_CANDIDATES:
+        bare = base.rstrip("/") + path
+        out.append(bare)
+        if date:
+            out.append(bare + "?d=" + quote(date))
+            if len(compact) == 8:
+                out.append(bare + "_" + compact)
+    return out
+
+
+def build_basketball_html_urls(domain_key: str = "com", date: Optional[str] = None) -> List[str]:
+    urls: List[str] = []
+    for dk in ([domain_key] if domain_key in DOMAINS else ["com", "usa"]):
+        base = DOMAINS[dk]
+        url = base.rstrip("/") + basketball_path(dk)
+        if date:
+            url += "?d=" + quote(date)
+        urls.append(url)
+    return urls
+
+
+async def fetch_flashscore_basketball_matches(
+    date: Optional[str] = None,
+    source: str = "auto",
+    domain: str = "com",
+    max_results: int = MAX_MATCHES_DEFAULT,
+    stop_after_first_success: bool = True,
+) -> Dict[str, Any]:
+    cache_key = json.dumps({
+        "sport": "basketball",
+        "date": date,
+        "source": source,
+        "domain": domain,
+        "max_results": max_results,
+        "stop_after_first_success": stop_after_first_success,
+    }, sort_keys=True)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        result = dict(cached)
+        result["cached"] = True
+        return result
+
+    attempts: List[Dict[str, Any]] = []
+    all_matches: List[Dict[str, Any]] = []
+    parser_meta: List[Dict[str, Any]] = []
+
+    sources_to_try: List[str] = []
+    if source in ("auto", "feed", "xfeed"):
+        sources_to_try.append("feed")
+    if source in ("auto", "html"):
+        sources_to_try.append("html")
+
+    domains_to_try = [domain] if domain in DOMAINS else ["com", "usa"]
+
+    for src in sources_to_try:
+        for dk in domains_to_try:
+            urls = build_basketball_feed_urls(dk, date) if src == "feed" else build_basketball_html_urls(dk, date)
+            for url in urls:
+                profiles = HEADER_PROFILES if src == "feed" else [
+                    ("desktop", dict(HEADERS, Accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")),
+                    ("googlebot", HEADER_PROFILES[2][1]),
+                ]
+                for profile_name, headers in profiles:
+                    base = DOMAINS.get(dk, DOMAINS["com"])
+                    h = dict(headers)
+                    h["Origin"] = base
+                    h["Referer"] = base.rstrip("/") + basketball_path(dk)
+                    got = await fetch_text(url, headers=h)
+                    text = got.pop("text", "")
+                    attempt = dict(got)
+                    attempt.update({"source": src, "sport": "basketball", "domain": dk, "profile": profile_name, "sample": text[:300]})
+                    attempts.append(attempt)
+                    if not got.get("ok") or not text:
+                        continue
+
+                    if src == "feed":
+                        matches, meta = parse_flashscore_feed(text, source_url=got.get("url") or url)
+                    else:
+                        matches, meta = parse_flashscore_html(text, source_url=got.get("url") or url)
+                    meta.update({"source": src, "sport": "basketball", "domain": dk, "profile": profile_name, "url": got.get("url") or url})
+                    parser_meta.append(meta)
+                    if matches:
+                        for m in matches:
+                            m["sport"] = "basketball"
+                        all_matches.extend(matches)
+                        if src == "feed" and stop_after_first_success:
+                            all_matches = dedupe_matches(all_matches)[:max_results]
+                            result = {
+                                "ok": True,
+                                "cached": False,
+                                "source": src,
+                                "sport": "basketball",
+                                "domain": dk,
+                                "date": date,
+                                "match_count": len(all_matches),
+                                "matches": all_matches,
+                                "attempts": attempts,
+                                "parser_meta": parser_meta,
+                            }
+                            return _cache_set(cache_key, result)
+
+    all_matches = dedupe_matches(all_matches)[:max_results]
+    result = {
+        "ok": bool(all_matches),
+        "cached": False,
+        "source": source,
+        "sport": "basketball",
+        "domain": domain,
+        "date": date,
+        "match_count": len(all_matches),
+        "matches": all_matches,
+        "attempts": attempts,
+        "parser_meta": parser_meta,
+        "note": "If match_count is 0, inspect /v2/debug/basketball/fetch. Flashscore may have blocked serverless HTTP or changed the feed format.",
+    }
+    return _cache_set(cache_key, result)
+
+
+@app.get("/v2/basketball")
+async def basketball(
+    date: Optional[str] = Query(None, description="Optional YYYY-MM-DD. If omitted, Flashscore default/today is used."),
+    source: str = Query("auto", description="auto, feed, or html"),
+    domain: str = Query("com", description="com, usa, or both"),
+    max_results: int = Query(MAX_MATCHES_DEFAULT, ge=1, le=1000),
+    exhaustive: bool = Query(False, description="Try all feed candidates instead of stopping after first successful feed."),
+) -> Dict[str, Any]:
+    if source not in {"auto", "feed", "xfeed", "html"}:
+        raise HTTPException(400, "source must be auto, feed, xfeed, or html")
+    if domain not in {"com", "usa", "both"}:
+        raise HTTPException(400, "domain must be com, usa, or both")
+    return await fetch_flashscore_basketball_matches(date=date, source=source, domain=domain, max_results=max_results, stop_after_first_success=not exhaustive)
+
+
+@app.get("/v2/basketball/details")
+async def basketball_details(
+    home: str = Query(..., description="Market home/team 1 full name, e.g. Virtus Bologna"),
+    away: str = Query(..., description="Market away/team 2 full name, e.g. Reyer Venezia"),
+    proposed: str = Query(..., description="Proposed side: home team, away team, Yes, or No"),
+    tournament: str = Query("", description="Optional competition/league filter, e.g. Serie A"),
+    question: str = Query("", description="Optional full Polymarket question/title for auto-detecting Yes/No team markets."),
+    market_type: str = Query("auto", description="auto is usually enough; optional override: moneyline, home_win_binary, away_win_binary, total, spread/handicap"),
+    date: Optional[str] = Query(None, description="Optional YYYY-MM-DD"),
+    source: str = Query("auto", description="auto, feed, or html"),
+    domain: str = Query("com", description="com, usa, or both"),
+    max_results: int = Query(MAX_MATCHES_DEFAULT, ge=1, le=1000),
+    exhaustive: bool = Query(True, description="Try every feed bucket before returning not_found."),
+) -> Dict[str, Any]:
+    data = await fetch_flashscore_basketball_matches(
+        date=date,
+        source=source,
+        domain=domain,
+        max_results=max_results,
+        stop_after_first_success=not exhaustive,
+    )
+    matches = data.get("matches") or []
+    # Competition text is a bonus. For Polymarket bkseriea, team-pair match is the primary gate.
+    match, candidates = choose_match(matches, home, away, tournament=tournament)
+    nearest: List[Dict[str, Any]] = []
+    for score, m in candidates[:12]:
+        c = compact_match(m)
+        c["pair_score"] = score
+        nearest.append(c)
+
+    target = {"home": home, "away": away, "proposed": proposed, "question": question, "market_type": market_type, "tournament": tournament, "date": date}
+    if not match:
+        return {
+            "verdict": "not_found",
+            "verified": False,
+            "safe_to_buy_yes": False,
+            "reason": "No Flashscore basketball HTTP row matched the requested teams/competition.",
+            "target": target,
+            "fetch_ok": data.get("ok"),
+            "match_count": data.get("match_count"),
+            "nearest": nearest,
+            "attempts": data.get("attempts", [])[:10],
+            "parser_meta": data.get("parser_meta", [])[:3],
+        }
+
+    matched = compact_match(match)
+    resolved_market_type = infer_market_type(question=question, proposed=proposed, home=home, away=away, requested=market_type)
+
+    # Basketball can reuse final-score evaluation for total/spread. Halftime soccer-specific
+    # markets are intentionally unsupported unless period data is parseable by evaluate_score_market.
+    if resolved_market_type in {"total", "spread", "halftime_leader_binary"}:
+        proposed_won, proposal_basis = evaluate_score_market(
+            match=match,
+            proposed=proposed,
+            question=question,
+            market_type=resolved_market_type,
+        )
+        if proposed_won is None:
+            return {
+                "verdict": "unsupported_or_not_ready",
+                "verified": False,
+                "safe_to_buy_yes": False,
+                "reason": proposal_basis,
+                "target": {**target, "resolved_market_type": resolved_market_type},
+                "matched": matched,
+                "nearest": nearest,
+                "attempts": data.get("attempts", [])[:10],
+            }
+        return {
+            "verdict": "verified_win" if proposed_won else "verified_loss",
+            "verified": True,
+            "safe_to_buy_yes": bool(proposed_won),
+            "reason": "Flashscore HTTP matched basketball row. market_type=%s; %s." % (resolved_market_type, proposal_basis),
+            "target": {**target, "resolved_market_type": resolved_market_type},
+            "matched": matched,
+            "nearest": nearest,
+            "attempts": data.get("attempts", [])[:10],
+        }
+
+    winner, basis = determine_winner(match)
+    if not winner:
+        return {
+            "verdict": "not_final_or_no_winner_proof",
+            "verified": False,
+            "safe_to_buy_yes": False,
+            "reason": "Matched the Flashscore basketball row, but could not prove a final winner from HTTP data yet.",
+            "target": {**target, "resolved_market_type": resolved_market_type},
+            "matched": matched,
+            "nearest": nearest,
+            "attempts": data.get("attempts", [])[:10],
+        }
+
+    proposed_won, proposal_basis = proposed_matches_winner(
+        proposed=proposed,
+        winner=winner,
+        home=matched.get("home") or home,
+        away=matched.get("away") or away,
+        market_type=resolved_market_type,
+    )
+    if proposed_won is None:
+        return {
+            "verdict": "unsupported_proposed_side",
+            "verified": False,
+            "safe_to_buy_yes": False,
+            "reason": proposal_basis,
+            "target": {**target, "resolved_market_type": resolved_market_type},
+            "matched": matched,
+            "nearest": nearest,
+            "attempts": data.get("attempts", [])[:10],
+        }
+
+    return {
+        "verdict": "verified_win" if proposed_won else "verified_loss",
+        "verified": True,
+        "safe_to_buy_yes": bool(proposed_won),
+        "reason": "Flashscore HTTP matched basketball row. Winner=%r by %s; proposed=%r; market_type=%s; %s." % (winner, basis, proposed, resolved_market_type, proposal_basis),
+        "target": {**target, "resolved_market_type": resolved_market_type},
+        "matched": matched,
+        "nearest": nearest,
+        "attempts": data.get("attempts", [])[:10],
+    }
+
+
+@app.get("/v2/debug/basketball/fetch")
+async def debug_basketball_fetch(
+    date: Optional[str] = Query(None),
+    source: str = Query("feed", description="feed, html, or auto"),
+    domain: str = Query("com", description="com, usa, or both"),
+    exhaustive: bool = Query(False, description="Try every feed candidate."),
+) -> Dict[str, Any]:
+    return await fetch_flashscore_basketball_matches(date=date, source=source, domain=domain, max_results=50, stop_after_first_success=not exhaustive)
